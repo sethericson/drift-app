@@ -209,6 +209,18 @@ p{margin:0}
 .rep[aria-pressed="true"] svg{transform:rotate(180deg)}
 .add{padding-right:7px}
 @media (max-width:380px){.rep{padding:0 11px}.rep svg{display:none}}
+.row{position:relative}
+.row.drag{z-index:15}
+.row.drag .shell{overflow:visible}
+.row.drag .card{box-shadow:var(--raise),0 0 0 1.5px rgba(255,214,10,.65),0 0 30px rgba(255,214,10,.3);filter:brightness(1.1)}
+.card{-webkit-touch-callout:none;-webkit-user-select:none;user-select:none}
+html.dragging,html.dragging *{-webkit-user-select:none;user-select:none;cursor:grabbing!important;overscroll-behavior:none}
+.hint{margin-top:2px;text-align:center;font-size:13px;color:var(--mute)}
+.days.still .fill{animation:none}
+.dl .xdel{flex:none;width:40px;height:40px;margin:-6px -6px -6px 0;border:0;border-radius:50%;background:none;color:var(--mute);display:grid;place-items:center;cursor:pointer;transition:color .2s,box-shadow .25s,transform .35s var(--spring)}
+.dl .xdel:hover{color:var(--cream);box-shadow:var(--raise-xs)}
+.dl .xdel:active{transform:scale(.92);box-shadow:var(--well-xs)}
+.dl .xdel svg{width:14px;height:14px}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;transition-delay:0s!important}
 }
@@ -252,6 +264,7 @@ p{margin:0}
     </form>
 
     <ul class="list" id="list"></ul>
+    <p class="hint" id="hint" hidden>Tap and hold a task, then drag to reorder</p>
     <div class="clear" id="clear" hidden><h2>All clear.</h2><p>Nothing left for today. Add something above.</p></div>
     <p class="foot" id="foot"></p>
   </section>
@@ -298,7 +311,7 @@ p{margin:0}
   const short = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
 
   /* ---------- state ----------
-     task: { i:id, t:text, c:created day, s:order, x:day finished | null, r:day removed | null, k:daily template id | null }
+     task: { o:manual position | null (set when you drag to reorder), i:id, t:text, c:created day, s:order, x:day finished | null, r:day removed | null, k:daily template id | null }
      recur: daily templates { i, t, lm:last day instances were ensured, end:day stopped | null }
      A task is on the list of every day from c until the day it is finished (or the day before it is removed),
      so unfinished work rolls forward by itself and sorts first because it is older.
@@ -316,7 +329,7 @@ p{margin:0}
     s.updatedAt = Number(raw.updatedAt) || 0;
     s.hist = raw.hist && typeof raw.hist === 'object' ? raw.hist : {};
     s.tasks = Array.isArray(raw.tasks) ? raw.tasks.filter(t => t && t.i && typeof t.t === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(t.c)) : [];
-    s.tasks.forEach(t => { t.s = Number(t.s) || 0; t.x = t.x || null; t.r = t.r || null; if (t.s >= s.seq) s.seq = t.s + 1; });
+    s.tasks.forEach(t => { t.s = Number(t.s) || 0; t.x = t.x || null; t.r = t.r || null; t.o = typeof t.o === 'number' ? t.o : null; if (t.s >= s.seq) s.seq = t.s + 1; });
     return s;
   }
   function lsLoad() { try { const v = localStorage.getItem(LS_KEY); return v ? JSON.parse(v) : null; } catch (e) { return null; } }
@@ -331,7 +344,8 @@ p{margin:0}
   const byAge = (a, b) => a.c < b.c ? -1 : a.c > b.c ? 1 : a.s - b.s;
   const lastDay = t => t.x ? t.x : (t.r ? addDays(t.r, -1) : null);
   const isActiveOn = (t, D) => { if (t.c > D) return false; const e = lastDay(t); return e === null || e >= D; };
-  const activeNow = () => S.tasks.filter(t => !t.x && !t.r && t.c <= TODAY).sort(byAge);
+  const byOrder = (a, b) => (a.o != null && b.o != null) ? a.o - b.o : a.o != null ? -1 : b.o != null ? 1 : byAge(a, b);
+  const activeNow = () => S.tasks.filter(t => !t.x && !t.r && t.c <= TODAY).sort(byOrder);
 
   function dayStats(D) {
     let total = 0, done = 0;
@@ -492,6 +506,7 @@ p{margin:0}
   const isOut = el => el.classList.contains('leaving') || el.classList.contains('gone');
 
   function renderList() {
+    if (drag) return;
     const tasks = activeNow();
     const wanted = new Set(tasks.map(t => t.i));
     for (const [id, el] of rowEls) {
@@ -514,6 +529,7 @@ p{margin:0}
       chip.textContent = txt; chip.hidden = !txt;
     });
     $('#clear').hidden = tasks.length > 0;
+    $('#hint').hidden = tasks.length < 2 || hintSeen;
   }
 
   function renderHeader() {
@@ -534,7 +550,7 @@ p{margin:0}
   function renderFoot() {
     $('#foot').textContent = sync === 'synced' ? 'Saved and synced to your account' : sync === 'saving' ? 'Saving…' : 'Saved on this device';
   }
-  function refresh() { renderHeader(); renderList(); if (view === 'cal') renderCal(); renderFoot(); }
+  function refresh() { renderHeader(); renderList(); if (view === 'cal') renderCal(true); renderFoot(); }
   function renderAll() { refresh(); }
 
   function toast(msg, undo) {
@@ -592,8 +608,109 @@ p{margin:0}
     refresh(); input.focus();
   });
 
+  /* ---------- tap and hold to reorder ---------- */
+  const HOLD_MS = 360;
+  let drag = null, press = null, holdT = 0;
+  let hintSeen = false; try { hintSeen = localStorage.getItem('drift.hint') === '1'; } catch (e) { /* ignore */ }
+  const liveRows = () => Array.from(list.children).filter(el => !isOut(el));
+
+  function persistOrder() {
+    const ids = liveRows().map(el => el.dataset.id);
+    mutate(() => { ids.forEach((id, i) => { const t = S.tasks.find(x => x.i === id); if (t) t.o = i; }); });
+    hintSeen = true; try { localStorage.setItem('drift.hint', '1'); } catch (e) { /* ignore */ }
+    refresh();
+  }
+
+  list.addEventListener('pointerdown', e => {
+    if (drag || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    if (e.target.closest('.check, .del')) return;
+    const li = e.target.closest('.row'); if (!li || isOut(li)) return;
+    press = { li, pid: e.pointerId, x: e.clientX, y: e.clientY };
+    clearTimeout(holdT); holdT = setTimeout(startDrag, HOLD_MS);
+  });
+  window.addEventListener('pointermove', e => {
+    if (drag) { if (e.pointerId === drag.pid) drag.cy = e.clientY; return; }
+    if (press && e.pointerId === press.pid && Math.hypot(e.clientX - press.x, e.clientY - press.y) > 9) { clearTimeout(holdT); press = null; }
+  });
+  const release = e => {
+    if (drag) { if (e.pointerId === drag.pid) endDrag(e.type === 'pointercancel'); return; }
+    clearTimeout(holdT); press = null;
+  };
+  window.addEventListener('pointerup', release);
+  window.addEventListener('pointercancel', release);
+  /* registered up front and not passive, so iOS lets us stop the page scrolling while a task is held */
+  document.addEventListener('touchmove', e => { if (drag) e.preventDefault(); }, { passive: false });
+  list.addEventListener('contextmenu', e => e.preventDefault());
+
+  function startDrag() {
+    if (!press) return;
+    const li = press.li, pid = press.pid, cy = press.y; press = null;
+    const rows = liveRows(), idx = rows.indexOf(li);
+    if (idx < 0 || rows.length < 2) return;
+    drag = { li, rows, idx, cur: idx, pid, cy, h: li.offsetHeight, tops: rows.map(r => r.offsetTop), hs: rows.map(r => r.offsetHeight), startPY: cy + window.scrollY, raf: 0 };
+    document.documentElement.classList.add('dragging');
+    li.classList.add('drag'); li.style.transition = 'none';
+    rows.forEach(r => { if (r !== li) r.style.transition = 'transform .32s var(--ease)'; });
+    try { if (navigator.vibrate) navigator.vibrate(12); } catch (e) { /* ignore */ }
+    try { li.setPointerCapture(pid); } catch (e) { /* ignore */ }
+    drag.raf = requestAnimationFrame(tick);
+  }
+  function tick() {
+    const d = drag; if (!d) return;
+    if (d.cy < 90) window.scrollBy(0, -14); else if (d.cy > window.innerHeight - 170) window.scrollBy(0, 14);
+    updateDrag();
+    d.raf = requestAnimationFrame(tick);
+  }
+  function updateDrag() {
+    const d = drag; if (!d) return;
+    const n = d.rows.length;
+    let dy = (d.cy + window.scrollY) - d.startPY;
+    dy = Math.max(d.tops[0] - d.tops[d.idx], Math.min(dy, d.tops[n - 1] + d.hs[n - 1] - d.h - d.tops[d.idx]));
+    d.li.style.transform = 'translateY(' + dy + 'px) scale(1.025)';
+    const center = d.tops[d.idx] + d.h / 2 + dy;
+    let cur = d.idx;
+    d.rows.forEach((r, j) => {
+      const mid = d.tops[j] + d.hs[j] / 2;
+      if (j > d.idx && mid <= center) cur++; else if (j < d.idx && mid >= center) cur--;
+    });
+    d.cur = cur;
+    d.rows.forEach((r, j) => {
+      if (j === d.idx) return;
+      let sh = 0;
+      if (d.idx < cur && j > d.idx && j <= cur) sh = -d.h; else if (d.idx > cur && j >= cur && j < d.idx) sh = d.h;
+      r.style.transform = sh ? 'translateY(' + sh + 'px)' : '';
+    });
+  }
+  function endDrag(cancelled) {
+    const d = drag; drag = null; cancelAnimationFrame(d.raf);
+    try { d.li.releasePointerCapture(d.pid); } catch (e) { /* ignore */ }
+    const slot = cancelled ? d.idx : d.cur;
+    const finalTop = slot > d.idx ? d.tops[slot] + d.hs[slot] - d.h : d.tops[slot];
+    d.li.classList.remove('drag');
+    d.li.style.transition = 'transform .28s var(--ease)';
+    d.li.style.transform = 'translateY(' + (finalTop - d.tops[d.idx]) + 'px)';
+    setTimeout(() => {
+      if (slot !== d.idx) list.insertBefore(d.li, slot > d.idx ? d.rows[slot].nextSibling : d.rows[slot]);
+      d.rows.forEach(r => { r.style.transition = 'none'; r.style.transform = ''; });
+      void list.offsetHeight;
+      d.rows.forEach(r => { r.style.transition = ''; });
+      document.documentElement.classList.remove('dragging');
+      if (slot !== d.idx) persistOrder();
+    }, 290);
+  }
+  /* keyboard: Alt + Up / Down on a focused task */
+  list.addEventListener('keydown', e => {
+    if (!e.altKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+    const li = e.target.closest('.row'); if (!li) return;
+    e.preventDefault();
+    const rows = liveRows(), i = rows.indexOf(li), j = i + (e.key === 'ArrowUp' ? -1 : 1);
+    if (j < 0 || j >= rows.length) return;
+    list.insertBefore(li, e.key === 'ArrowUp' ? rows[j] : rows[j].nextSibling);
+    persistOrder(); e.target.focus();
+  });
+
   /* ---------- calendar view ---------- */
-  function renderCal() {
+  function renderCal(still) {
     $('#caltitle').textContent = MO[calM] + ' ' + calY;
     const lead = new Date(calY, calM, 1, 12).getDay();
     const dim = new Date(calY, calM + 1, 0).getDate();
@@ -608,6 +725,7 @@ p{margin:0}
       h += '<button type="button" class="day' + (ds === TODAY ? ' is-today' : '') + (future ? ' future' : '') + '" data-d="' + ds + '" aria-pressed="' + (ds === sel) + '" aria-label="' + label + '"><span class="dn">' + d + '</span><span class="tube">' + fill + '</span></button>';
     }
     $('#days').innerHTML = h;
+    $('#days').classList.toggle('still', !!still);
     renderDetail();
   }
   function renderDetail() {
@@ -622,12 +740,21 @@ p{margin:0}
     h += '<div class="d-main"><div class="big">' + (st.total ? st.pct + '<small>%</small>' : '–') + '</div><div class="d-sub">' +
       (st.total ? st.done + ' of ' + st.total + ' finished' : (future ? 'Nothing planned yet' : 'Nothing was on the list')) + '</div></div>';
     h += '<div class="bar" aria-hidden="true"><i style="--p:' + st.pct + '"></i></div>';
-    if (fin.length) h += '<h3>Finished · ' + fin.length + '</h3><ul>' + fin.map(t => '<li class="fin"><span class="dot">' + check + '</span><span class="t">' + esc(t.t) + '</span></li>').join('') + '</ul>';
+    if (fin.length) h += '<h3>Finished · ' + fin.length + '</h3><ul>' + fin.map(t => '<li class="fin"><span class="dot">' + check + '</span><span class="t">' + esc(t.t) + '</span><button type="button" class="xdel" data-id="' + esc(t.i) + '" aria-label="Delete finished task: ' + esc(t.t) + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button></li>').join('') + '</ul>';
     if (open.length) h += '<h3>' + (isToday ? 'Still to do' : 'Not finished') + ' · ' + open.length + '</h3><ul>' +
       open.map(t => '<li class="open"><span class="dot"></span><span class="t">' + esc(t.t) + '</span>' + (isToday ? '' : '<span class="n">Moved to ' + nextDay + '</span>') + '</li>').join('') + '</ul>';
     if (!tasks.length && st.total) h += '<p class="muted">The task details for this day are archived. The totals above still count.</p>';
     $('#detail').innerHTML = h;
   }
+  $('#detail').addEventListener('click', e => {
+    const b = e.target.closest('.xdel'); if (!b) return;
+    const idx = S.tasks.findIndex(x => x.i === b.dataset.id);
+    if (idx < 0 || !S.tasks[idx].x) return;
+    const t = S.tasks[idx];
+    mutate(() => { S.tasks.splice(idx, 1); });
+    refresh();
+    toast('Deleted: ' + short(t.t, 24), () => { mutate(() => { S.tasks.push(t); }); refresh(); });
+  });
   $('#days').addEventListener('click', e => {
     const b = e.target.closest('.day'); if (!b) return;
     sel = b.dataset.d;
@@ -671,7 +798,7 @@ p{margin:0}
 
   /* ---------- reload every hour (waits while something is being typed) ---------- */
   async function hourlyReload() {
-    if (input.value.trim()) { setTimeout(hourlyReload, 120000); return; }
+    if (input.value.trim() || drag) { setTimeout(hourlyReload, 120000); return; }
     try { if (docRef && S.updatedAt > 0) await flush(); } catch (e) { /* local copy is already saved */ }
     try { location.reload(); } catch (e) { refreshToday(); }
   }
